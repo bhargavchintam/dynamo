@@ -432,7 +432,7 @@ The [custom policy examples](https://github.com/ai-dynamo/dynamo/blob/main/examp
 | `ScoredWorkerCandidate::cost()` | Sum of all scorer contributions for the picker row |
 | `WorkerInputView::info(row)` | Picker row `WorkerInfo`, or `None` for an out-of-range row |
 
-`WorkerInfo` holds static facts about a worker rank, so no component declares an input group to read it. `worker()` returns the worker ID and data-parallel rank. `max_num_batched_tokens()` and `total_kv_blocks()` return what the worker's runtime config advertises, or `None` when it is unreported or reported as zero (vLLM's Ray data-parallel backend registers a zero placeholder); `total_kv_blocks()` is capacity, not free blocks. The values change only when a worker registers again. For filters, scorers, and pickers Dynamo looks them up in its cached worker configs on each `info()` call, so a component that never calls it pays nothing. Classifier rows outlive that map, so they carry each rank's capacity (32 bytes per rank) whenever a classifier declares an input group.
+`WorkerInfo` holds static facts about a worker rank, so no component declares an input group to read it. `worker()` returns the worker ID and data-parallel rank. `max_num_batched_tokens()` and `total_kv_blocks()` return what the worker's runtime config advertises, or `None` when it is unreported or reported as zero (vLLM's Ray data-parallel backend registers a zero placeholder); `total_kv_blocks()` is capacity, not free blocks. `cache_owner_host_pinned_blocks()` and `cache_owner_disk_blocks()` return the host DRAM and disk capacity, in KV blocks, of the KVCR instance attached to the rank, or `None` when the worker does not advertise it; see [KVCR Occupancy](#kvcr-occupancy). The values change only when a worker registers again. For filters, scorers, and pickers Dynamo looks them up in its cached worker configs on each `info()` call, so a component that never calls it pays nothing. Classifier rows outlive that map, so they carry each rank's capacity (48 bytes per rank) whenever a classifier declares an input group.
 
 ### Optional Worker Inputs
 
@@ -446,6 +446,7 @@ If a component needs no optional worker data, return `WorkerInputs::NONE`. Combi
 | `CACHE` | `accounting_cache_estimate()` | Accounting estimate as weighted KV blocks and rounded tokens; zero if missing, not clamped to prompt length |
 | `CACHE` | `has_tier_matches()` | Whether the lookup contains any GPU, CPU, or disk matches before filtering; `false` means only accounting estimates or no cache data were supplied |
 | `CACHE` | `shared_hits()` | `None` if no shared result was supplied; otherwise unweighted ranges with `total_hits` and `hits_beyond(prefix)` |
+| `CACHE` | `WorkerCandidate::cache_owner_usage()`, `WorkerInputView::cache_owner_usage(row)` | KV blocks the router has indexed for the worker's attached KVCR instance, as `host_pinned_blocks()` and `disk_blocks()`; `None` when the worker has no attached KVCR instance or the router uses a remote indexer. See [KVCR Occupancy](#kvcr-occupancy) |
 | `LOAD` | `is_available()` | Whether the host supplied a load observation; distinguishes missing data from an observed idle worker |
 | `LOAD` | `active_prefill_tokens()` | Tokens currently active in the worker's prefill stage |
 | `LOAD` | `active_decode_blocks()` | KV blocks the worker's active requests hold; excludes this request. Prompt blocks by default, plus the blocks generation adds only with `--router-track-output-blocks`; zero with `--no-router-track-active-blocks` |
@@ -497,6 +498,52 @@ impl WorkerScorer for UncoveredPromptScorer {
                 .and_then(|transfer| transfer.source_prefix_blocks())
                 .map_or(0.0, f64::from);
             *cost = (context.request_blocks() as f64 - cached.max(fetchable)).max(0.0);
+        }
+        Ok(())
+    }
+}
+```
+
+### KVCR Occupancy
+
+A KVCR instance is the host-memory KV cache attached to one worker rank. A cost function can compute how full it is by dividing the blocks it holds by its capacity:
+
+- **Blocks held** come from `cache_owner_usage()`, which needs `CACHE`. Dynamo counts the distinct blocks its own lower-tier index holds for the instance, per tier, from the KVCR Stored, Removed, and Cleared events. Counts are live, so two reads in one selection can differ. They are not weighted or clamped. Because events are best effort, a count can differ from the instance's real contents: slots KVCR is still filling are not yet announced, non-main KV groups are not indexed, and a lost Removed event counts until the instance's next recovery. While a worker moves between instances, it can briefly have two; their counts are summed.
+- **Capacity** comes from `WorkerInfo::cache_owner_host_pinned_blocks()` and `cache_owner_disk_blocks()`, which need no input group. A vLLM worker advertises the host capacity from its KVCR tier's `secondary_g2_slots`, or from `--kvcr-host-capacity-blocks` when the pool comes from `kvcr-service`. Disk capacity is advertised only with `--kvcr-disk-capacity-blocks`. See the [vLLM configuration reference](../../../../reference/backends/vllm-configuration.mdx).
+
+KVCR evicts least-recently-used blocks to make room, so a warm instance usually reads close to full. Reading the counts adds no work to selection unless a component calls the accessor; each call is a few hash lookups.
+
+This scorer adds a cost that grows with the host DRAM occupancy of each worker's KVCR instance:
+
+```rust
+use dynamo_kv_router::plugins::worker_selection::{
+    WorkerCandidates, WorkerInputs, WorkerScorer, WorkerSelectionContext, WorkerSelectionPolicyError,
+};
+
+struct KvcrOccupancyScorer {
+    weight: f64,
+}
+
+impl WorkerScorer for KvcrOccupancyScorer {
+    fn required_worker_inputs(&self) -> WorkerInputs {
+        WorkerInputs::CACHE
+    }
+
+    fn score(
+        &self,
+        _context: &WorkerSelectionContext<'_>,
+        candidates: WorkerCandidates<'_>,
+        costs: &mut [f64],
+    ) -> Result<(), WorkerSelectionPolicyError> {
+        for (candidate, cost) in candidates.iter().zip(costs) {
+            let capacity = candidate.info().cache_owner_host_pinned_blocks();
+            let occupancy = match (candidate.cache_owner_usage(), capacity) {
+                (Some(usage), Some(capacity)) => {
+                    (usage.host_pinned_blocks() as f64 / capacity as f64).min(1.0)
+                }
+                _ => 0.0,
+            };
+            *cost = self.weight * occupancy;
         }
         Ok(())
     }

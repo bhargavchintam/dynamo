@@ -18,12 +18,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::indexer::{
-    KvIndexerMetrics, LowerTierContinuation, LowerTierIndexer, LowerTierMatchDetails, MatchDetails,
-    ThreadPoolIndexer, WireTieredMatchDetails, record_unsupported_residency_event,
+    CacheOwnerBlockCounts, KvIndexerMetrics, LowerTierContinuation, LowerTierIndexer,
+    LowerTierMatchDetails, MatchDetails, ThreadPoolIndexer, WireTieredMatchDetails,
+    record_unsupported_residency_event,
 };
 use crate::kv_hints::{KvTransferCandidateSource, KvTransferCandidates};
+use crate::plugins::worker_selection::CacheOwnerUsage;
 use crate::protocols::{
     LocalBlockHash, ResidencyProjection, ResidencyRoutingSnapshot, RouterEvent, StorageTier,
+    WorkerWithDpRank,
 };
 use arc_swap::ArcSwap;
 use rustc_hash::FxHashMap;
@@ -135,6 +138,66 @@ impl LowerTierIndexers {
 
     pub fn record_unsupported_residency_event(&self, event: &RouterEvent) {
         record_unsupported_residency_event(self.metrics.as_deref(), event);
+    }
+
+    /// Pin the current owner projection and per-tier owner counts for one selection.
+    /// Taking the reader costs one `ArcSwap` load per allocated tier plus one for the
+    /// projection; the counts it reads stay live.
+    pub fn cache_owner_usage(&self) -> CacheOwnerUsageReader {
+        let indexers = self.indexers.read().unwrap();
+        let blocks = |tier| {
+            indexers
+                .get(&tier)
+                .map(|indexer| indexer.backend().cache_owner_blocks())
+        };
+        CacheOwnerUsageReader {
+            snapshot: self.routing_snapshot.load_full(),
+            host_pinned: blocks(StorageTier::HostPinned),
+            disk: blocks(StorageTier::Disk),
+        }
+    }
+}
+
+/// Reads how many blocks each worker's attached cache owners (KVCR instances) hold,
+/// from the router's own lower-tier index.
+///
+/// The owner-to-worker projection is the one pinned when the reader was taken; the
+/// block counts are read live on each call.
+#[derive(Clone)]
+pub struct CacheOwnerUsageReader {
+    snapshot: Arc<ResidencyRoutingSnapshot>,
+    host_pinned: Option<CacheOwnerBlockCounts>,
+    disk: Option<CacheOwnerBlockCounts>,
+}
+
+impl CacheOwnerUsageReader {
+    /// Blocks indexed for the cache owners projected to `worker`, per tier. None when no
+    /// cache owner is projected to the worker. A worker with two owners, which happens
+    /// only while it moves between them, reads their sum.
+    pub fn usage(&self, worker: WorkerWithDpRank) -> Option<CacheOwnerUsage> {
+        let owners = self.snapshot.projection().cache_owners_of(worker);
+        if owners.is_empty() {
+            return None;
+        }
+        let sum = |counts: &Option<CacheOwnerBlockCounts>| {
+            counts.as_ref().map_or(0, |counts| {
+                owners.iter().map(|&owner| counts.get(owner)).sum()
+            })
+        };
+        Some(CacheOwnerUsage::new(
+            sum(&self.host_pinned),
+            sum(&self.disk),
+        ))
+    }
+}
+
+impl std::fmt::Debug for CacheOwnerUsageReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CacheOwnerUsageReader")
+            .field("host_pinned", &self.host_pinned.is_some())
+            .field("disk", &self.disk.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -521,6 +584,84 @@ mod tests {
                 .backend()
                 .root_workers(LocalBlockHash(11), &projection)
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_owner_usage_reads_attached_owner_per_tier() {
+        let owner = cache_owner_id(4);
+        let other = cache_owner_id(5);
+        let worker = WorkerWithDpRank::new(17, 0);
+        let moved_to = WorkerWithDpRank::new(29, 0);
+        let indexers = LowerTierIndexers::new(2, 4);
+        let store = |owner, tier, event_id, local: &[u64], external: &[u64]| {
+            RouterEvent::with_cache_owner(
+                worker.worker_id,
+                KvCacheEvent {
+                    event_id,
+                    dp_rank: worker.dp_rank,
+                    data: KvCacheEventData::Stored(KvCacheStoreData {
+                        parent_hash: None,
+                        start_position: None,
+                        blocks: stored_blocks_with_sequence_hashes(&local_hashes(local), external),
+                    }),
+                },
+                tier,
+                owner,
+            )
+        };
+
+        // No owner projected yet.
+        assert_eq!(indexers.cache_owner_usage().usage(worker), None);
+
+        indexers.set_residency_projection(ResidencyProjection::new([(owner, worker)]).unwrap());
+        assert_eq!(
+            indexers.cache_owner_usage().usage(worker),
+            Some(CacheOwnerUsage::new(0, 0)),
+            "a projected owner with no indexed blocks reads 0"
+        );
+
+        let host = indexers.get_or_create(StorageTier::HostPinned);
+        host.apply_event_and_wait(store(
+            owner,
+            StorageTier::HostPinned,
+            1,
+            &[11, 12],
+            &[101, 102],
+        ))
+        .await
+        .unwrap();
+        // Another owner's blocks are not this worker's.
+        host.apply_event_and_wait(store(other, StorageTier::HostPinned, 2, &[21], &[201]))
+            .await
+            .unwrap();
+        let reader = indexers.cache_owner_usage();
+        assert_eq!(reader.usage(worker), Some(CacheOwnerUsage::new(2, 0)));
+
+        // A tier allocated after the reader was taken is absent from it.
+        let disk = indexers.get_or_create(StorageTier::Disk);
+        disk.apply_event_and_wait(store(owner, StorageTier::Disk, 3, &[11], &[101]))
+            .await
+            .unwrap();
+        assert_eq!(reader.usage(worker), Some(CacheOwnerUsage::new(2, 0)));
+        assert_eq!(
+            indexers.cache_owner_usage().usage(worker),
+            Some(CacheOwnerUsage::new(2, 1))
+        );
+
+        // Re-attaching the owner moves its usage to the new worker.
+        indexers.set_residency_projection(ResidencyProjection::new([(owner, moved_to)]).unwrap());
+        let reader = indexers.cache_owner_usage();
+        assert_eq!(reader.usage(worker), None);
+        assert_eq!(reader.usage(moved_to), Some(CacheOwnerUsage::new(2, 1)));
+
+        // A worker briefly holding two owners reads their sum.
+        indexers.set_residency_projection(
+            ResidencyProjection::new([(owner, moved_to), (other, moved_to)]).unwrap(),
+        );
+        assert_eq!(
+            indexers.cache_owner_usage().usage(moved_to),
+            Some(CacheOwnerUsage::new(3, 1))
         );
     }
 

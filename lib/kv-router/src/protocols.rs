@@ -320,6 +320,18 @@ pub trait WorkerConfigLike {
         None
     }
 
+    /// Host-pinned (DRAM) capacity, in blocks, of the cache owner (KVCR instance)
+    /// attached to each data-parallel rank of this worker, if advertised.
+    fn cache_owner_host_pinned_blocks(&self) -> Option<u64> {
+        None
+    }
+
+    /// Disk capacity, in blocks, of the cache owner (KVCR instance) attached to
+    /// each data-parallel rank of this worker, if advertised.
+    fn cache_owner_disk_blocks(&self) -> Option<u64> {
+        None
+    }
+
     fn taints(&self) -> &HashSet<String> {
         &EMPTY_WORKER_TAINTS
     }
@@ -610,6 +622,9 @@ fn update_cache_owner_hash(hasher: &mut blake3::Hasher, owner: CacheOwnerId) {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResidencyProjection {
     exact_owners: FxHashMap<ResidencyOwnerKey, WorkerWithDpRank>,
+    /// Reverse of `exact_owners`, each list sorted. A worker normally has one
+    /// cache owner; it has two only while it moves between owners.
+    worker_owners: FxHashMap<WorkerWithDpRank, Vec<ResidencyOwnerKey>>,
 }
 
 impl ResidencyProjection {
@@ -627,8 +642,16 @@ impl ResidencyProjection {
                         proposed: worker,
                     });
                 }
-                _ => {}
+                Some(_) => {}
+                None => projection
+                    .worker_owners
+                    .entry(worker)
+                    .or_default()
+                    .push(key),
             }
+        }
+        for owners in projection.worker_owners.values_mut() {
+            owners.sort_unstable();
         }
         Ok(projection)
     }
@@ -648,6 +671,12 @@ impl ResidencyProjection {
 
     pub fn cache_owner_worker(&self, cache_owner: CacheOwnerId) -> Option<WorkerWithDpRank> {
         self.project(ResidencyOwner::cache_owner(cache_owner))
+    }
+
+    /// Cache owners currently projected to `worker`, in key order. Empty when the
+    /// worker has none.
+    pub fn cache_owners_of(&self, worker: WorkerWithDpRank) -> &[ResidencyOwnerKey] {
+        self.worker_owners.get(&worker).map_or(&[], Vec::as_slice)
     }
 
     pub fn is_empty(&self) -> bool {

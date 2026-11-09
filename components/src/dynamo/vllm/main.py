@@ -57,7 +57,7 @@ from dynamo.llm import (
 )
 from dynamo.runtime import Endpoint
 from dynamo.runtime.logging import configure_dynamo_logging
-from dynamo.vllm.kv_hints import publish_kv_hint_capabilities
+from dynamo.vllm.kv_hints import kvcr_capacity_blocks, publish_kv_hint_capabilities
 from dynamo.vllm.nixl_telemetry import allow_nixl_telemetry_capture
 from dynamo.vllm.worker_factory import WorkerFactory
 
@@ -1001,6 +1001,14 @@ async def register_vllm_model(
         )
         num_gpu_blocks = 0
     runtime_config.total_kv_blocks = per_rank_kv_blocks(num_gpu_blocks, dp_range[1])
+    (
+        runtime_config.cache_owner_host_pinned_blocks,
+        runtime_config.cache_owner_disk_blocks,
+    ) = kvcr_capacity_blocks(
+        config.engine_args,
+        config.kvcr_host_capacity_blocks,
+        config.kvcr_disk_capacity_blocks,
+    )
     runtime_config.max_num_seqs = runtime_values["max_num_seqs"]
     runtime_config.max_num_batched_tokens = runtime_values["max_num_batched_tokens"]
     runtime_config.enable_local_indexer = config.enable_local_indexer

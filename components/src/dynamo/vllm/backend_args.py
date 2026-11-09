@@ -354,6 +354,34 @@ class DynamoVllmArgGroup(ArgGroup):
             ),
         )
 
+        # KVCR capacity advertised to router cost functions
+        add_argument(
+            g,
+            flag_name="--kvcr-host-capacity-blocks",
+            env_var="DYN_VLLM_KVCR_HOST_CAPACITY_BLOCKS",
+            default=None,
+            arg_type=int,
+            help=(
+                "Host DRAM capacity, in KV blocks, of each data-parallel rank's KVCR "
+                "instance, advertised so router cost functions can compute KVCR "
+                "occupancy. Defaults to the KVCR tier's secondary_g2_slots; set it "
+                "when the pool comes from kvcr-service (kvcr_service_socket_path)."
+            ),
+        )
+        add_argument(
+            g,
+            flag_name="--kvcr-disk-capacity-blocks",
+            env_var="DYN_VLLM_KVCR_DISK_CAPACITY_BLOCKS",
+            default=None,
+            arg_type=int,
+            help=(
+                "Disk (G3) capacity, in KV blocks, of each data-parallel rank's KVCR "
+                "instance, advertised so router cost functions can compute KVCR "
+                "occupancy. Not derived from the G3 config; unset leaves it "
+                "unreported."
+            ),
+        )
+
         # Benchmark / self-profiling
         add_argument(
             g,
@@ -648,6 +676,10 @@ class DynamoVllmConfig(ConfigBase):
     # GMS shadow mode
     gms_shadow_mode: bool = False
 
+    # KVCR capacity advertised to router cost functions, per data-parallel rank
+    kvcr_host_capacity_blocks: Optional[int] = None
+    kvcr_disk_capacity_blocks: Optional[int] = None
+
     # Extra served names beyond the primary, parsed from --served-model-name.
     # None (not []) since ConfigBase copies class defaults by reference.
     served_model_aliases: Optional[List[str]] = None
@@ -701,6 +733,7 @@ class DynamoVllmConfig(ConfigBase):
         self._validate_classify_worker_exclusivity()
         self._validate_custom_encoder()
         self._validate_freeze_gc_after_init()
+        self._validate_kvcr_capacity()
         self._load_explicit_benchmark_points()
         self._resolve_legacy_benchmark_sampling()
         self._validate_benchmark_sampling()
@@ -921,6 +954,15 @@ class DynamoVllmConfig(ConfigBase):
                 "--embedding-frontend-tokenization cannot be combined with "
                 "--use-vllm-tokenizer."
             )
+
+    def _validate_kvcr_capacity(self) -> None:
+        """Reject a negative advertised KVCR capacity."""
+        for flag, blocks in (
+            ("--kvcr-host-capacity-blocks", self.kvcr_host_capacity_blocks),
+            ("--kvcr-disk-capacity-blocks", self.kvcr_disk_capacity_blocks),
+        ):
+            if blocks is not None and blocks < 0:
+                raise ValueError(f"{flag} must be non-negative.")
 
     def _validate_embedding_worker_processes(self) -> None:
         """Validate the embedding-only shared-EngineCore process count."""

@@ -1192,6 +1192,185 @@ mod tests {
         assert_eq!(declared, vec![(0, None), (1, None)]);
     }
 
+    #[tokio::test]
+    async fn components_read_cache_owner_usage_only_with_cache() {
+        use crate::identity::{
+            CacheOwnerId, CacheSemanticsId, ClusterId, IdentitySource, IndexerDomainId, PoolId,
+            RoutingScopeId, StableDpSlotId,
+        };
+        use crate::indexer::LowerTierIndexers;
+        use crate::plugins::worker_selection::CacheOwnerUsage;
+        use crate::protocols::{
+            KvCacheEvent, KvCacheEventData, KvCacheStoreData, LocalBlockHash, ResidencyProjection,
+            RouterEvent, StorageTier,
+        };
+        use crate::test_utils::stored_blocks_with_sequence_hashes;
+        use std::sync::{Arc, Mutex};
+
+        struct KvcrWorker;
+
+        impl WorkerConfigLike for KvcrWorker {
+            fn data_parallel_start_rank(&self) -> u32 {
+                0
+            }
+
+            fn data_parallel_size(&self) -> u32 {
+                1
+            }
+
+            fn max_num_batched_tokens(&self) -> Option<u64> {
+                None
+            }
+
+            fn total_kv_blocks(&self) -> Option<u64> {
+                None
+            }
+
+            fn cache_owner_host_pinned_blocks(&self) -> Option<u64> {
+                Some(1024)
+            }
+        }
+
+        type Seen = Arc<Mutex<Vec<(u64, Option<CacheOwnerUsage>, Option<u64>)>>>;
+        let sorted = |seen: &Seen| {
+            let mut seen = seen.lock().unwrap().clone();
+            seen.sort_unstable_by_key(|(worker_id, ..)| *worker_id);
+            seen
+        };
+
+        struct UsageScorer {
+            inputs: WorkerInputs,
+            seen: Seen,
+        }
+
+        impl WorkerScorer for UsageScorer {
+            fn required_worker_inputs(&self) -> WorkerInputs {
+                self.inputs
+            }
+
+            fn score(
+                &self,
+                _context: &WorkerSelectionContext<'_>,
+                candidates: WorkerCandidates<'_>,
+                costs: &mut [f64],
+            ) -> Result<(), WorkerSelectionPolicyError> {
+                for (candidate, cost) in candidates.iter().zip(costs) {
+                    self.seen.lock().unwrap().push((
+                        candidate.worker().worker_id,
+                        candidate.cache_owner_usage(),
+                        candidate.info().cache_owner_host_pinned_blocks(),
+                    ));
+                    *cost = 0.0;
+                }
+                Ok(())
+            }
+        }
+
+        struct UsagePicker {
+            seen: Seen,
+        }
+
+        impl WorkerPicker for UsagePicker {
+            fn required_worker_inputs(&self) -> WorkerInputs {
+                WorkerInputs::CACHE
+            }
+
+            fn pick(
+                &self,
+                _context: &WorkerSelectionContext<'_>,
+                input: WorkerInputView<'_>,
+            ) -> Result<usize, WorkerSelectionPolicyError> {
+                for (row, candidate) in input.candidates().iter().enumerate() {
+                    self.seen.lock().unwrap().push((
+                        candidate.worker().worker_id,
+                        input.cache_owner_usage(row),
+                        input
+                            .info(row)
+                            .and_then(|info| info.cache_owner_host_pinned_blocks()),
+                    ));
+                }
+                Ok(0)
+            }
+        }
+
+        // Worker 0's KVCR instance holds two host-pinned blocks; worker 1 has none attached.
+        let owner = CacheOwnerId::new(
+            PoolId::new(
+                IndexerDomainId::new(
+                    CacheSemanticsId::new([1; 16], IdentitySource::Explicit),
+                    RoutingScopeId::new([2; 16], IdentitySource::Explicit),
+                ),
+                ClusterId::new(3),
+            ),
+            StableDpSlotId::new([4; 16], IdentitySource::Explicit),
+        );
+        let attached = WorkerWithDpRank::from_worker_id(0);
+        let indexers = LowerTierIndexers::new(1, 16);
+        indexers.set_residency_projection(ResidencyProjection::new([(owner, attached)]).unwrap());
+        indexers
+            .get_or_create(StorageTier::HostPinned)
+            .apply_event_and_wait(RouterEvent::with_cache_owner(
+                attached.worker_id,
+                KvCacheEvent {
+                    event_id: 1,
+                    dp_rank: attached.dp_rank,
+                    data: KvCacheEventData::Stored(KvCacheStoreData {
+                        parent_hash: None,
+                        start_position: None,
+                        blocks: stored_blocks_with_sequence_hashes(
+                            &[LocalBlockHash(11), LocalBlockHash(12)],
+                            &[101, 102],
+                        ),
+                    }),
+                },
+                StorageTier::HostPinned,
+                owner,
+            ))
+            .await
+            .unwrap();
+
+        let mut request = base_request(64);
+        request.cache_owner_usage = Some(indexers.cache_owner_usage());
+        let workers = HashMap::from([(0, KvcrWorker), (1, KvcrWorker)]);
+        let (cache, load, picker) = (Seen::default(), Seen::default(), Seen::default());
+        let policy = WorkerSelectionPolicy::new_with_filters(
+            KvRouterConfig::default(),
+            "test",
+            Vec::new(),
+            vec![
+                Box::new(UsageScorer {
+                    inputs: WorkerInputs::CACHE,
+                    seen: cache.clone(),
+                }),
+                Box::new(UsageScorer {
+                    inputs: WorkerInputs::LOAD,
+                    seen: load.clone(),
+                }),
+            ],
+            Box::new(UsagePicker {
+                seen: picker.clone(),
+            }),
+        );
+        policy
+            .select_worker(WorkerSelectionInput::configured(
+                &workers,
+                &request,
+                request.eligibility(),
+                16,
+            ))
+            .unwrap();
+
+        let attached_usage = Some(CacheOwnerUsage::new(2, 0));
+        let expected = vec![(0, attached_usage, Some(1024)), (1, None, Some(1024))];
+        assert_eq!(sorted(&cache), expected);
+        assert_eq!(sorted(&picker), expected);
+        // Capacity needs no declaration; usage needs CACHE.
+        assert_eq!(
+            sorted(&load),
+            vec![(0, None, Some(1024)), (1, None, Some(1024))]
+        );
+    }
+
     #[test]
     fn worker_info_reaches_every_component_without_declaration() {
         struct ReportedKvFilter;

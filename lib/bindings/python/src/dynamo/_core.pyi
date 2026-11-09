@@ -939,6 +939,8 @@ class ModelRuntimeConfig:
 
     context_length: int | None
     total_kv_blocks: int | None
+    cache_owner_host_pinned_blocks: int | None
+    cache_owner_disk_blocks: int | None
     max_num_seqs: int | None
     max_num_batched_tokens: int | None
     tool_call_parser: str | None

@@ -290,6 +290,16 @@ pub struct ModelRuntimeConfig {
     /// estimate and must not silently become a hard-admission denominator.
     pub total_kv_blocks: Option<u64>,
 
+    /// Host-pinned (DRAM) capacity, in KV blocks, of the cache owner (KVCR instance)
+    /// attached to each router-visible data-parallel rank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_owner_host_pinned_blocks: Option<u64>,
+
+    /// Disk capacity, in KV blocks, of the cache owner (KVCR instance) attached to
+    /// each router-visible data-parallel rank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_owner_disk_blocks: Option<u64>,
+
     pub max_num_seqs: Option<u64>,
 
     pub max_num_batched_tokens: Option<u64>,
@@ -454,6 +464,8 @@ impl Default for ModelRuntimeConfig {
         Self {
             context_length: None,
             total_kv_blocks: None,
+            cache_owner_host_pinned_blocks: None,
+            cache_owner_disk_blocks: None,
             max_num_seqs: None,
             max_num_batched_tokens: None,
             tool_call_parser: None,
@@ -592,6 +604,14 @@ impl dynamo_kv_router::WorkerConfigLike for ModelRuntimeConfig {
             .get("native_offloading_capacity")?
             .get("total_tokens")?
             .as_u64()
+    }
+
+    fn cache_owner_host_pinned_blocks(&self) -> Option<u64> {
+        self.cache_owner_host_pinned_blocks
+    }
+
+    fn cache_owner_disk_blocks(&self) -> Option<u64> {
+        self.cache_owner_disk_blocks
     }
 
     fn taints(&self) -> &HashSet<String> {
@@ -1280,6 +1300,35 @@ mod tests {
             .unwrap();
 
         assert_eq!(config.native_offloading_capacity_tokens(), Some(300));
+    }
+
+    #[test]
+    fn cache_owner_capacity_round_trips_and_reaches_worker_capacity() {
+        use dynamo_kv_router::plugins::worker_selection::WorkerCapacity;
+
+        // A record from a worker that predates the fields parses as unreported.
+        let legacy = serde_json::to_value(ModelRuntimeConfig::default()).unwrap();
+        assert!(legacy.get("cache_owner_host_pinned_blocks").is_none());
+        let legacy: ModelRuntimeConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.cache_owner_host_pinned_blocks, None);
+        assert_eq!(legacy.cache_owner_disk_blocks, None);
+
+        let config = ModelRuntimeConfig {
+            cache_owner_host_pinned_blocks: Some(1024),
+            cache_owner_disk_blocks: Some(0),
+            ..Default::default()
+        };
+        let restored: ModelRuntimeConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(restored, config);
+
+        let capacity = WorkerCapacity::of(&restored);
+        assert_eq!(capacity.cache_owner_host_pinned_blocks(), Some(1024));
+        assert_eq!(
+            capacity.cache_owner_disk_blocks(),
+            None,
+            "a reported zero means unreported"
+        );
     }
 
     #[test]

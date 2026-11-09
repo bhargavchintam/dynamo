@@ -210,6 +210,18 @@ These flags control which role this worker plays in a disaggregated deployment. 
   Environment variable: `DYN_VLLM_GMS_SHADOW_MODE`
 </ParamField>
 
+<ParamField path="--kvcr-host-capacity-blocks" type="integer" default="secondary_g2_slots">
+  Host DRAM capacity, in KV blocks, of each data-parallel rank's KVCR instance. The worker advertises it so router cost functions can compute KVCR occupancy. By default it is the KVCR tier's `secondary_g2_slots`. Set it when the KVCR pool comes from `kvcr-service` (`kvcr_service_socket_path`), because vLLM then ignores `secondary_g2_slots`.
+
+  Environment variable: `DYN_VLLM_KVCR_HOST_CAPACITY_BLOCKS`
+</ParamField>
+
+<ParamField path="--kvcr-disk-capacity-blocks" type="integer" default="unset">
+  Disk (G3) capacity, in KV blocks, of each data-parallel rank's KVCR instance, advertised for router cost functions. It is not derived from the G3 configuration; when unset, the worker reports no disk capacity.
+
+  Environment variable: `DYN_VLLM_KVCR_DISK_CAPACITY_BLOCKS`
+</ParamField>
+
 ## Benchmarking
 
 These flags control the self-benchmark sweep that runs on startup before the worker begins accepting production requests.

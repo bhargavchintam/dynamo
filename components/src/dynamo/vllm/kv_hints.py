@@ -78,6 +78,38 @@ def _secondary_tiers(engine_args: AsyncEngineArgs) -> list[Mapping[str, Any]]:
     return tiers
 
 
+def kvcr_capacity_blocks(
+    engine_args: AsyncEngineArgs,
+    host_override: int | None = None,
+    disk_override: int | None = None,
+) -> tuple[int | None, int | None]:
+    """Return (host DRAM, disk) KV-block capacity of each rank's KVCR instance.
+
+    The router divides the blocks it indexes for a rank's KVCR instance by these
+    values to get occupancy. Host DRAM defaults to the KVCR tier's
+    ``secondary_g2_slots``: one slot holds one KV block, and each data-parallel
+    rank gets its own instance. vLLM ignores the slot count when
+    ``kvcr_service_socket_path`` is set, because the pool then comes from
+    kvcr-service, so that setup needs ``host_override``. Disk has no default: a
+    G3 slot is the engine's KV row stride, which this process cannot see.
+    """
+    host = host_override
+    kvcr_tiers = [
+        tier for tier in _secondary_tiers(engine_args) if tier.get("type") == "kvcr"
+    ]
+    if host is None and len(kvcr_tiers) == 1:
+        tier = kvcr_tiers[0]
+        slots = tier.get("secondary_g2_slots")
+        if (
+            tier.get("kvcr_service_socket_path") is None
+            and isinstance(slots, int)
+            and not isinstance(slots, bool)
+            and slots > 0
+        ):
+            host = slots
+    return host, disk_override
+
+
 def _supports_transfer_hint(tier: Mapping[str, Any]) -> bool:
     """Return whether a secondary tier advertises TRANSFER capability."""
     capabilities = tier.get("router_capabilities")

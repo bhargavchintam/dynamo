@@ -13,7 +13,7 @@ from dynamo.common.constants import (
     KV_HINT_TRANSFER_WORKER_TYPE_RUNTIME_KEY,
 )
 from dynamo.llm import WorkerType
-from dynamo.vllm.kv_hints import publish_kv_hint_capabilities
+from dynamo.vllm.kv_hints import kvcr_capacity_blocks, publish_kv_hint_capabilities
 
 pytestmark = [
     pytest.mark.unit,
@@ -360,3 +360,59 @@ def test_publish_kv_hint_capabilities_reads_tier_inside_multi_connector():
         KV_HINT_TRANSFER_SOURCE_CONTROL_ENDPOINTS_RUNTIME_KEY,
         json.dumps({"0": "tcp://127.0.0.1:17771"}),
     )
+
+
+# KVCR capacity advertised to router cost functions: host DRAM defaults to the
+# tier's secondary_g2_slots, overrides win, and disk is never derived.
+@pytest.mark.parametrize(
+    ("tier", "overrides", "expected"),
+    [
+        pytest.param(
+            {"type": "kvcr", "secondary_g2_slots": 1024},
+            (None, None),
+            (1024, None),
+            id="host-from-slots",
+        ),
+        pytest.param(
+            {
+                "type": "kvcr",
+                "secondary_g2_slots": 1024,
+                "kvcr_service_socket_path": "/run/kvcr.sock",
+                "compatibility_digest": "abc",
+            },
+            (None, None),
+            (None, None),
+            id="kvcr-service-pool-ignores-slots",
+        ),
+        pytest.param(
+            {
+                "type": "kvcr",
+                "kvcr_service_socket_path": "/run/kvcr.sock",
+                "compatibility_digest": "abc",
+            },
+            (2048, 4096),
+            (2048, 4096),
+            id="overrides",
+        ),
+        pytest.param(
+            {"type": "kvcr", "secondary_g2_slots": 0},
+            (None, None),
+            (None, None),
+            id="no-local-dram",
+        ),
+        pytest.param(
+            {"type": "custom", "secondary_g2_slots": 1024},
+            (None, None),
+            (None, None),
+            id="not-kvcr",
+        ),
+    ],
+)
+def test_kvcr_capacity_blocks(tier, overrides, expected):
+    engine_args = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config={"secondary_tiers": [tier]}
+        )
+    )
+
+    assert kvcr_capacity_blocks(engine_args, *overrides) == expected
