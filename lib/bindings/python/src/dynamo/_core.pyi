@@ -2103,6 +2103,15 @@ def _convert_preprocessed_request(
     """
     ...
 
+def _raise_routed_http_error(code: int, message: str) -> None:
+    """Test hook: raise what a routed engine's response stream raises for a
+    backend `HttpError(code, message)`."""
+    ...
+
+def _map_python_exception(error: BaseException) -> str:
+    """Test hook: the error a Python engine's escaped `error` becomes, as text."""
+    ...
+
 
 class WorkerType:
     """
@@ -3396,6 +3405,21 @@ class WorkerUnavailable(DynamoException):
     """
 
     ...
+
+class RoutedEngineError(ValueError):
+    """A backend error raised by `RoutedEngine.generate` or its response stream.
+
+    Raised for every classified error except a validation error, which raises
+    `InvalidArgument`. A chat engine that lets it escape answers with the
+    backend's status, because the original error is restored.
+    """
+
+    # The error's semantic class, e.g. "Unavailable".
+    error_class: str
+    # The HTTP status the backend raised explicitly (an `HttpError`), if any.
+    status_code: Optional[int]
+    # The backend's client-safe message, if it set one.
+    public_message: Optional[str]
 
 class SelectionServiceError(DynamoException):
     """

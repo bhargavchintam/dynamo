@@ -39,7 +39,8 @@ use dynamo_runtime::pipeline::ManyIn;
 
 use super::context::{Context, callable_accepts_kwarg};
 use super::errors::{
-    http_like_error_to_dynamo, py_exception_to_backend_error, worker_unavailable_to_dynamo,
+    http_like_error_to_dynamo, py_exception_to_backend_error, routed_engine_error_to_dynamo,
+    worker_unavailable_to_dynamo,
 };
 use crate::python_payload::{
     EncodedPythonResponse, PythonPayload, PythonResponseItem, WaitClassification,
@@ -528,6 +529,12 @@ where
     Ok(response)
 }
 
+/// Test hook: the error a Python engine's escaped `error` becomes, as text.
+#[pyfunction]
+pub fn _map_python_exception(error: Bound<'_, PyAny>) -> String {
+    map_python_exception(PyErr::from_value(error)).to_string()
+}
+
 pub(crate) fn map_python_exception(error: PyErr) -> DynamoError {
     Python::with_gil(|py| {
         error.display(py);
@@ -535,6 +542,10 @@ pub(crate) fn map_python_exception(error: PyErr) -> DynamoError {
         // Checked before the backend mapping, whose `DynamoException` fallback
         // would otherwise classify it as `Unknown`.
         if let Some(error) = worker_unavailable_to_dynamo(py, &error) {
+            return error;
+        }
+        // A routed backend's error the engine let escape keeps its class and status.
+        if let Some(error) = routed_engine_error_to_dynamo(py, &error) {
             return error;
         }
 

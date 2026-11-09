@@ -3,7 +3,9 @@
 
 import pytest
 
+from dynamo._core import _map_python_exception, _raise_routed_http_error
 from dynamo.llm import HttpError
+from dynamo.llm.exceptions import RoutedEngineError
 
 pytestmark = [
     pytest.mark.gpu_0,
@@ -39,3 +41,15 @@ def test_long_http_error_message():
     # Ensure the exception string uses the truncated message too.
     assert message[:8189] in str(error)
     assert "B" not in str(error)
+
+
+def test_routed_engine_error_keeps_backend_status():
+    with pytest.raises(RoutedEngineError) as raised:
+        _raise_routed_http_error(503, "worker busy")
+
+    error = raised.value
+    # Callers that caught the ValueError raised before still catch it.
+    assert isinstance(error, ValueError)
+    assert (error.error_class, error.status_code) == ("Unavailable", 503)
+    # Escaping a chat engine restores the backend's error instead of a 400.
+    assert _map_python_exception(error) == str(error)
