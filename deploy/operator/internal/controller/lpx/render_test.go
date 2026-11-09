@@ -28,6 +28,8 @@ import (
 	commoncontroller "github.com/ai-dynamo/dynamo/deploy/operator/internal/controller_common"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo/lpx"
+	commoncapnpv1 "github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo/lpx/manifest/common/v1"
+	deploymentcapnpv1 "github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo/lpx/manifest/deployment/v1"
 	manifestcapnpv2 "github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo/lpx/manifest/v2"
 	lpxv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo/lpx/scheduler/v1alpha1"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/features"
@@ -69,6 +71,9 @@ func TestGenerateGrovePodCliqueSet_FromDGDYaml(t *testing.T) {
 	runtimeConfig := &commoncontroller.RuntimeConfig{}
 
 	tests := []string{
+		"from_dgd_yaml/units-qwen",
+		"from_dgd_yaml/units-gpt-oss",
+
 		"from_dgd_yaml/lpx_v2_vllm",
 		"from_dgd_yaml/node-local-v2-lpu-only",
 		"from_dgd_yaml/node-local-v2-hybrid",
@@ -105,6 +110,33 @@ func TestGenerateGrovePodCliqueSet_FromDGDYaml(t *testing.T) {
 			child := newLPXRenderDeployment(t, &dynamoDeployment)
 			workloads, plans, err := r.resolveWorkloads(t.Context(), child, &dynamoDeployment)
 			require.NoError(t, err)
+			if want, ok := map[string]struct {
+				roots      []int64
+				connectors int
+			}{
+				"from_dgd_yaml/units-qwen":    {[]int64{0, 1}, 1},
+				"from_dgd_yaml/units-gpt-oss": {[]int64{1, 12, 13}, 1},
+			}[name]; ok {
+				t.Log("Check compiler roots, Agent counts and connector requests before rendering")
+				plan, workload := plans["lpu"], workloads["lpu"]
+				_, requests := resolvePipelineRequests(child, nil, workload, plan)
+				require.Len(t, requests, 1)
+				spec := requests[0].Spec
+				require.Len(t, spec.Partitions, len(want.roots))
+				for i, root := range want.roots {
+					require.Equal(t, root, spec.Partitions[i].CompilerPartitionID)
+				}
+				require.Len(t, spec.PropSyncConnectors, want.connectors)
+				require.EqualValues(t, len(want.roots), plan.Agents[0].Replicas)
+				if name == "from_dgd_yaml/units-qwen" {
+					pairs := *spec.PropSyncConnectors[0].Requirement.Connections
+					require.Len(t, pairs, 16)
+					for i, pair := range pairs {
+						require.EqualValues(t, i, pair.FromLogicalDevice)
+						require.EqualValues(t, i, pair.ToLogicalDevice)
+					}
+				}
+			}
 			got, extraResources, err := r.renderPodCliqueSet(t.Context(), child, &dynamoDeployment, workloads, plans, nil)
 			require.NoError(t, err)
 			servingHash, err := dynamo.ComputeDGDWorkersSpecHash(&dynamoDeployment)
@@ -985,6 +1017,10 @@ func newTestDataModelRegistry(t *testing.T, registryRoot string) lpx.ModelRegist
 		writeTestGraphBuild(t, registryRoot, buildID, testV3GraphManifestCapnp(t, fixture))
 	}
 
+	for _, name := range []string{"qwen", "gpt-oss"} {
+		writeUnitsGraphBuild(t, registryRoot, "units-"+name, name)
+	}
+
 	registry, err := lpx.NewModelRegistry(registryRoot, nil)
 	require.NoError(t, err)
 	return registry
@@ -1588,4 +1624,107 @@ func newLPXGPUClient(t *testing.T) client.Client {
 		&resourcev1.DeviceClass{Name: "gpu.nvidia.com", Spec: resourcev1.DeviceClassSpec{Selectors: []resourcev1.DeviceSelector{{CEL: &resourcev1.CELDeviceSelector{Expression: `device.driver == "gpu.nvidia.com"`}}}}},
 		&resourcev1.ResourceClaimTemplate{Name: "decode-gpu", Namespace: "test", Spec: resourcev1.ResourceClaimTemplateSpec{Spec: resourcev1.ResourceClaimSpec{Devices: resourcev1.DeviceClaim{Requests: []resourcev1.DeviceRequest{{Name: "gpu", Exactly: &resourcev1.ExactDeviceRequest{DeviceClassName: "gpu.nvidia.com", AllocationMode: resourcev1.DeviceAllocationModeExactCount, Count: 1}}}}}}},
 	).Build()
+}
+
+func writeUnitsGraphBuild(t *testing.T, root, buildID, shape string) {
+	t.Helper()
+	width, count := uint32(16), 1
+	mode := deploymentcapnpv1.CompilationMode_lpuOnly
+	extra := commoncapnpv1.DeviceType_lpu
+	switch shape {
+	case "qwen":
+		count, mode, extra = 2, deploymentcapnpv1.CompilationMode_lpx, commoncapnpv1.DeviceType_cpu
+	case "gpt-oss":
+		width, count, mode, extra = 8, 14, deploymentcapnpv1.CompilationMode_lpx, commoncapnpv1.DeviceType_cuda
+	}
+	writeLPXCheckpointTestBuild(t, root, buildID, mode, checkpointTestModel, checkpointTestRevision)
+	path := filepath.Join(root, buildID, "deployment.v1.capnp.bin")
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	message, err := capnp.Unmarshal(data)
+	require.NoError(t, err)
+	deployment, err := deploymentcapnpv1.ReadRootDeployment(message)
+	require.NoError(t, err)
+	writable, _ := capnp.NewSingleSegmentMessage(nil)
+	require.NoError(t, writable.SetRoot(deployment.ToPtr()))
+	deployment, err = deploymentcapnpv1.ReadRootDeployment(writable)
+	require.NoError(t, err)
+	config, err := deployment.Config()
+	require.NoError(t, err)
+	total := count
+	if extra != commoncapnpv1.DeviceType_lpu {
+		total++
+	}
+	partitions, err := deployment.NewPartitions(int32(total))
+	require.NoError(t, err)
+	for i := range count {
+		ref, err := partitions.At(i).NewPartition()
+		require.NoError(t, err)
+		ref.SetDeviceType(commoncapnpv1.DeviceType_lpu)
+		ref.SetPartitionId(uint32(i))
+		detail, err := partitions.At(i).Detail().NewLpu()
+		require.NoError(t, err)
+		require.NoError(t, detail.SetPath(fmt.Sprintf("part-%d", i)))
+		detail.SetDevicesPerNode(width)
+		detail.SetArchitecture(deploymentcapnpv1.LpuArchitecture_lp20)
+		if width == 16 {
+			detail.SetArchitecture(deploymentcapnpv1.LpuArchitecture_lp30)
+		}
+	}
+	if total != count {
+		ref, err := partitions.At(count).NewPartition()
+		require.NoError(t, err)
+		ref.SetDeviceType(extra)
+	}
+	groups := make([][][]uint32, count)
+	for i := range count {
+		groups[i] = [][]uint32{{uint32(i)}}
+	}
+	switch shape {
+	case "qwen":
+		groups = [][][]uint32{{{0}, {1}}}
+	case "gpt-oss":
+		groups = append(groups[:12], [][]uint32{{12}, {13}})
+	}
+	units, err := config.NewLpuUnits(int32(len(groups)))
+	require.NoError(t, err)
+	for i, group := range groups {
+		reservations, err := units.At(i).NewReservations(int32(len(group)))
+		require.NoError(t, err)
+		for j, members := range group {
+			ids, err := reservations.At(j).NewPartitionIds(int32(len(members)))
+			require.NoError(t, err)
+			for k, id := range members {
+				ids.Set(k, id)
+			}
+			if width == 8 {
+				reservations.At(j).Size().SetNodes(1)
+			} else {
+				hx, err := reservations.At(j).Size().NewHx()
+				require.NoError(t, err)
+				hx.SetTraysPerHemisphere(1)
+				hx.SetHemispheres(1)
+				hx.SetRacks(1)
+			}
+		}
+		connectors, err := units.At(i).NewConnectors(int32(len(group) - 1))
+		require.NoError(t, err)
+		for j := 0; j < connectors.Len(); j++ {
+			if width == 8 {
+				connectors.At(j).SetXt8888Gap()
+			} else {
+				hx, err := connectors.At(j).NewHxPropSyncV1()
+				require.NoError(t, err)
+				pairs, err := hx.NewConnections(16)
+				require.NoError(t, err)
+				for k := 0; k < pairs.Len(); k++ {
+					pairs.At(k).SetFromDevice(uint32(k))
+					pairs.At(k).SetToDevice(uint32(k))
+				}
+			}
+		}
+	}
+	data, err = writable.Marshal()
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o600))
 }
